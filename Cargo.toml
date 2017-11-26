@@ -1,0 +1,12 @@
+[package]
+name = "webrtc-live"
+version = "0.1.0"
+authors = ["hellooo <yomicerisier@gmail.com>"]
+
+[dependencies]
+ws = "*"
+url = "*"
+rustc-serialize = "*"
+chan = "*"
+regex = "*"
+rand = "0.3"
