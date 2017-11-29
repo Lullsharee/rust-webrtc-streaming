@@ -1,7 +1,6 @@
 extern crate ws;
 extern crate rustc_serialize;
 extern crate regex;
-extern crate chan;
 extern crate url;
 extern crate rand;
 
@@ -11,7 +10,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use rustc_serialize::json::{self, ToJson, Json};
 use regex::Regex;
-use std::thread;
+use std::thread::spawn;
 use std::sync::{Arc, Mutex};
 use std::collections::{BTreeMap, HashMap};
 use rand::Rng;
@@ -135,12 +134,12 @@ impl ToJson for StreamList {
 struct Viewer {
     id: u32,
     client: Sender,
-    sl: Rc<RefCell<StreamList>>,
+    sl: Arc<Mutex<StreamList>>,
 }
 
 impl Viewer {
     fn view_id(&mut self, id: u32) -> ws::Result<()> {
-        let mut sl = self.sl.borrow_mut();
+        let mut sl = self.sl.lock().unwrap();
         let s_id = sl.streams.get_mut(&id);
         match s_id {
             Some(stream) => {
@@ -187,7 +186,7 @@ impl Handler for Viewer {
         if let Ok(text) = msg.into_text() {
             let f: Result<Offertext, _> = json::decode(&text);
             if let Ok(get_text) = f {
-                let mut streamlist = self.sl.borrow_mut();
+                let mut streamlist = self.sl.lock().unwrap();
                 let s_id = streamlist.streams.get_mut(&get_text.stream_id);
                 match s_id {
                     Some(stream) => {
@@ -204,7 +203,7 @@ impl Handler for Viewer {
             } else {
                 let f: Result<ICE_cadinate, _> = json::decode(&text);
                 if let Ok(get_text) = f {
-                    let mut streamlist = self.sl.borrow_mut();
+                    let mut streamlist = self.sl.lock().unwrap();
                     let s_id = streamlist.streams.get_mut(&get_text.id);
                     match s_id {
                         Some(stream) => {
@@ -233,15 +232,13 @@ impl Handler for Viewer {
 }
 struct Hoster {
     client: Sender,
-    streamlist: Rc<RefCell<StreamList>>,
+    streamlist: Arc<Mutex<StreamList>>,
     id: u32,
-    tx: chan::Sender<String>,
-    rx: chan::Receiver<String>,
 }
 
 impl Handler for Hoster {
     fn on_open(&mut self, _: Handshake) -> ws::Result<()> {
-        let mut streamlist = self.streamlist.borrow_mut();
+        let mut streamlist = self.streamlist.lock().unwrap();
         let viewers = Arc::new(Mutex::new(BTreeMap::new()));
         let client = self.client.clone();
         streamlist.streams.insert(
@@ -261,7 +258,7 @@ impl Handler for Hoster {
         if let Ok(text) = msg.into_text() {
             let f: Result<AnswerSDP, _> = json::decode(&text);
             if let Ok(frame) = f {
-                let mut streamlist = self.streamlist.borrow_mut();
+                let mut streamlist = self.streamlist.lock().unwrap();
                 let s = streamlist.streams.get_mut(&self.id);
                 match s {
                     Some(stream) => {
@@ -289,7 +286,7 @@ impl Handler for Hoster {
             } else {
                 let f: Result<Source, _> = json::decode(&text);
                 if let Ok(frame) = f {
-                    let mut streamlist = self.streamlist.borrow_mut();
+                    let mut streamlist = self.streamlist.lock().unwrap();
                     let s = streamlist.streams.get_mut(&self.id);
                     match s {
                         Some(stream) => {
@@ -305,7 +302,7 @@ impl Handler for Hoster {
                 } else {
                     let f: Result<ICE_cadinate, _> = json::decode(&text);
                     if let Ok(get_text) = f {
-                        let mut streamlist = self.streamlist.borrow_mut();
+                        let mut streamlist = self.streamlist.lock().unwrap();
                         let s_id = streamlist.streams.get_mut(&self.id);
                         match s_id {
                             Some(stream) => {
@@ -362,11 +359,11 @@ impl Handler for Hoster {
         }
     }
     fn on_close(&mut self, _: CloseCode, _: &str) {
-        let mut streamlist = self.streamlist.borrow_mut();
+        let mut streamlist = self.streamlist.lock().unwrap();
         let _ = streamlist.streams.remove(&self.id);
     }
     fn on_error(&mut self, _: ws::Error) {
-        let mut streamlist = self.streamlist.borrow_mut();
+        let mut streamlist = self.streamlist.lock().unwrap();
         let _ = streamlist.streams.remove(&self.id);
     }
 }
@@ -374,11 +371,13 @@ impl Handler for Hoster {
 
 struct ConnectList {
     client: Sender,
-    sl: Rc<RefCell<StreamList>>,
+    sl: Arc<Mutex<StreamList>>,
 }
 impl Handler for ConnectList {
     fn on_open(&mut self, _: Handshake) -> ws::Result<()> {
-        self.client.send(self.sl.borrow().to_json().to_string())
+        self.client.send(
+            self.sl.lock().unwrap().to_json().to_string(),
+        )
     }
 
     fn on_message(&mut self, _: Message) -> ws::Result<()> {
@@ -389,7 +388,7 @@ impl Handler for ConnectList {
 struct Router {
     client: Sender,
     route: Box<Handler>,
-    streamlist: Rc<RefCell<StreamList>>,
+    streamlist: Arc<Mutex<StreamList>>,
 }
 
 impl Router {
@@ -422,8 +421,7 @@ impl Handler for Router {
                 )
             }
             "/host" => {
-                let (tx, rx) = chan::async();
-                let id = self.streamlist.borrow_mut().new_id();
+                let id = self.streamlist.lock().unwrap().new_id();
 
                 self.route_to(
                     req,
@@ -431,8 +429,6 @@ impl Handler for Router {
                         client: client,
                         streamlist: streamlist,
                         id: id,
-                        tx: tx,
-                        rx: rx,
                     }),
                 )
             }
@@ -472,16 +468,19 @@ impl Handler for Router {
 
 
 fn main() {
-    let sl = Rc::new(RefCell::new(StreamList {
+    let sl = Arc::new(Mutex::new(StreamList {
         streams: BTreeMap::new(),
         fresh_id: 0,
     }));
-    listen("127.0.0.1:3333", |client| {
-        let cout = client.clone();
-        Router {
-            client: client,
-            streamlist: sl.clone(),
-            route: Box::new(move |_| cout.close(CloseCode::Error)),
-        }
-    }).unwrap();
+    let server = spawn(move || {
+        listen("127.0.0.1:3333", |client| {
+            let cout = client.clone();
+            Router {
+                client: client,
+                streamlist: sl.clone(),
+                route: Box::new(move |_| cout.close(CloseCode::Error)),
+            }
+        }).unwrap()
+    });
+    let _ = server.join();
 }
