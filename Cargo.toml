@@ -7,6 +7,5 @@ authors = ["hellooo <yomicerisier@gmail.com>"]
 ws = "*"
 url = "*"
 rustc-serialize = "*"
-chan = "*"
 regex = "*"
 rand = "0.3"

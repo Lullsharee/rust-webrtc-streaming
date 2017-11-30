@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>0 Streams Online</title>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="common.css">
+  <script>
+    var remote = {
+      set streams(s) {
+        s = s.filter(function(x) {
+          return x.ready === true;
+        });
+        _streams = s;
+        
+        if(s.length !== 1) {
+          document.title = "" + s.length + " Streams Online";
+        }
+        else {
+          document.title = "1 Stream Online";
+        }
+        
+        var ul = "";
+        for(stream of _streams) {
+          if(stream.name != "") {
+            ul += "<li><a href=\"view.html?id=" + stream.id + "#" + stream.name + "\">" + stream.name + "</a></li>";
+          }
+        }
+        
+        if(s.length == 0) {
+          ul = "No streams found";
+        }
+        document.getElementById("stream_list").innerHTML = ul;
+      },
+      get streams() {
+        return _streams;
+      },
+      _streams: []
+    }
+    function refreshStreams() {
+      var connection = new WebSocket("ws://127.0.0.1:3333/list");
+      
+      connection.onmessage = function(message) {
+        var sl = JSON.parse(message.data);
+        remote.streams = sl.streams;
+        //document.getElementById("debug").innerHTML = sl;
+        connection.send("Bye");
+      }
+    }
+    
+    window.onload = refreshStreams;
+  </script>
+</head>
+
+<body>
+  <div id="header">
+    <h1>helloooo Streaming</h1>
+  </div>
+  <div id="content" class="stream_list">
+    <ul id="stream_list">
+      No streams found 
+    </ul>
+    <span id="debug"></span>
+  </div>
+</body>
+</html>
