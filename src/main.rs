@@ -15,12 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::collections::{BTreeMap, HashMap};
 use rand::Rng;
 
+trait CreateMessage {
+    fn create_message(&self) -> String;
+}
+
 #[derive(RustcDecodable, RustcEncodable)]
 struct Offertext {
     typed: String,
     sdp: String,
     stream_id: u32,
 }
+
 
 #[derive(RustcDecodable, RustcEncodable)]
 struct OfferSDP {
@@ -45,6 +50,12 @@ struct AnswerSDP {
     client_id: u32,
 }
 
+impl CreateMessage for AnswerSDP {
+    fn create_message(&self) -> String {
+        self.to_json().to_string()
+    }
+}
+
 impl ToJson for AnswerSDP {
     fn to_json(&self) -> Json {
         let mut mb = BTreeMap::new();
@@ -60,6 +71,11 @@ struct ICE_cadinate {
     id: u32,
 }
 
+impl CreateMessage for ICE_cadinate {
+    fn create_message(&self) -> String {
+        self.to_json().to_string()
+    }
+}
 
 impl ToJson for ICE_cadinate {
     fn to_json(&self) -> Json {
@@ -108,6 +124,42 @@ impl ToJson for Stream {
     }
 }
 
+enum ResMessage {
+    Offer(OfferSDP),
+    OfferMsg(Offertext),
+    Answer(AnswerSDP),
+    AnswerMsg(Source),
+    IceCandinate(ICE_cadinate),
+    Nomessage { text: String },
+}
+trait ToMessage {
+    fn to_message(&self) -> ResMessage;
+}
+
+impl ToMessage for String {
+    fn to_message(&self) -> ResMessage {
+        let msg = match &self {
+            req if self.contains("offer") => {
+                let text: Offertext = json::decode(req).unwrap();
+                ResMessage::OfferMsg(text)
+            }
+            req if self.contains("answer") => {
+                let text: AnswerSDP = json::decode(req).unwrap();
+                ResMessage::Answer(text)
+            }
+            req if self.contains("candidate") => {
+                let text: ICE_cadinate = json::decode(req).unwrap();
+                ResMessage::IceCandinate(text)
+            }
+            _ => {
+                let text: Source = json::decode(&self).unwrap();
+                ResMessage::AnswerMsg(text)
+            }
+        };
+        msg
+    }
+}
+
 #[derive(Clone)]
 struct StreamList {
     streams: BTreeMap<u32, Stream>,
@@ -130,6 +182,7 @@ impl ToJson for StreamList {
         Json::Object(bm)
     }
 }
+
 
 struct Viewer {
     id: u32,
@@ -184,48 +237,49 @@ impl Handler for Viewer {
 
     fn on_message(&mut self, msg: Message) -> ws::Result<()> {
         if let Ok(text) = msg.into_text() {
-            let f: Result<Offertext, _> = json::decode(&text);
-            if let Ok(get_text) = f {
-                let mut streamlist = self.sl.lock().unwrap();
-                let s_id = streamlist.streams.get_mut(&get_text.stream_id);
-                match s_id {
-                    Some(stream) => {
-                        println!("success sdp");
-                        let send_sdp = OfferSDP {
-                            typed: get_text.typed,
-                            sdp: get_text.sdp,
-                            client_id: self.id,
-                        };
-                        stream.hoster.send(send_sdp.to_json().to_string());
-                    }
-                    _ => println!("not exist this steram id {}", &get_text.stream_id),
-                }
-            } else {
-                let f: Result<ICE_cadinate, _> = json::decode(&text);
-                if let Ok(get_text) = f {
+            let req = text.to_message();
+            match req {
+                ResMessage::OfferMsg(Offertext {
+                                         typed,
+                                         sdp,
+                                         stream_id,
+                                     }) => {
                     let mut streamlist = self.sl.lock().unwrap();
-                    let s_id = streamlist.streams.get_mut(&get_text.id);
+                    let s_id = streamlist.streams.get_mut(&stream_id);
+                    match s_id {
+                        Some(stream) => {
+                            println!("success sdp");
+                            let send_sdp = OfferSDP {
+                                typed: typed,
+                                sdp: sdp,
+                                client_id: self.id,
+                            };
+                            stream.hoster.send(send_sdp.to_json().to_string());
+                        }
+                        _ => println!("not exist this steram id {}", &stream_id),
+                    }
+                }
+                ResMessage::IceCandinate(ICE_cadinate { typed, ice, id }) => {
+                    let mut streamlist = self.sl.lock().unwrap();
+                    let s_id = streamlist.streams.get_mut(&id);
                     match s_id {
                         Some(stream) => {
                             println!("success cadinate");
-                            let ice = ICE {
-                                candidate: get_text.ice.candidate,
-                                sdpMid: get_text.ice.sdpMid,
-                                sdpMLineIndex: get_text.ice.sdpMLineIndex,
-                            };
-                            let ice_cadinate = ICE_cadinate {
-                                typed: get_text.typed,
+                            let res = ICE_cadinate {
+                                typed: typed,
                                 ice: ice,
-                                id: get_text.id,
+                                id: id,
                             };
-                            stream.hoster.send(ice_cadinate.to_json().to_string());
+                            stream.hoster.send(res.create_message());
                         }
-                        _ => println!("not exist this steram id {}", &get_text.id),
+                        _ => println!("not exist this steram id {}", &id),
                     }
-                } else {
-                    println!("cant perse {}", &text);
                 }
+                _ => println!("don't exist this message patter{}", &text),
             }
+        } else {
+            println!("Couldn't get message");
+            self.client.close(CloseCode::Protocol);
         }
         Ok(())
     }
@@ -256,41 +310,87 @@ impl Handler for Hoster {
 
     fn on_message(&mut self, msg: Message) -> ws::Result<()> {
         if let Ok(text) = msg.into_text() {
-            let f: Result<AnswerSDP, _> = json::decode(&text);
-            if let Ok(frame) = f {
-                let mut streamlist = self.streamlist.lock().unwrap();
-                let s = streamlist.streams.get_mut(&self.id);
-                match s {
-                    Some(stream) => {
-                        let v = stream.viewers.lock();
-                        match v {
-                            Ok(mut viewers) => {
-                                let viewer = viewers.get_mut(&frame.client_id);
-                                match viewer {
-                                    Some(out) => {
-                                        out.send(frame.to_json().to_string());
-                                    }
-
-                                    _ => println!("not exist this client id {}", &frame.client_id),
-                                }
-                            }
-                            _ => println!("Error: poisoned on Client iD{}", frame.client_id),
-                        }
-                        Ok(())
-                    }
-                    _ => {
-                        println!("Couldn't find stream ID | ID:{}", self.id);
-                        self.client.close(CloseCode::Protocol)
-                    }
-                }
-            } else {
-                let f: Result<Source, _> = json::decode(&text);
-                if let Ok(frame) = f {
+            let req = text.to_message();
+            match req {
+                ResMessage::Answer(AnswerSDP {
+                                       typed,
+                                       sdp,
+                                       client_id,
+                                   }) => {
                     let mut streamlist = self.streamlist.lock().unwrap();
                     let s = streamlist.streams.get_mut(&self.id);
                     match s {
                         Some(stream) => {
-                            stream.name = frame.name;
+                            let v = stream.viewers.lock();
+                            match v {
+                                Ok(mut viewers) => {
+                                    let viewer = viewers.get_mut(&client_id);
+                                    match viewer {
+                                        Some(out) => {
+                                            println!("get answer");
+                                            let res = AnswerSDP {
+                                                typed: typed,
+                                                sdp: sdp,
+                                                client_id: client_id,
+                                            };
+                                            out.send(res.create_message());
+                                        }
+                                        _ => println!("not exist this client id {}", &client_id),
+                                    }
+                                }
+                                _ => {
+                                    println!("Error: poisoned on Client iD{}", client_id);
+                                }
+                            }
+                            Ok(())
+                        }
+                        _ => {
+                            println!("Couldn't find stream ID | ID:{}", self.id);
+                            self.client.close(CloseCode::Protocol)
+                        }
+                    }
+                }
+                ResMessage::IceCandinate(ICE_cadinate { typed, ice, id }) => {
+                    let mut streamlist = self.streamlist.lock().unwrap();
+                    let s = streamlist.streams.get_mut(&self.id);
+                    match s { 
+                        Some(stream) => {
+                            let v = stream.viewers.lock();
+                            match v { 
+                                Ok(mut viewers) => {
+                                    let viewer = viewers.get_mut(&id);
+                                    match viewer { 
+                                        Some(out) => {
+                                            println!("get hoster ice ");
+                                            let res = ICE_cadinate {
+                                                typed: typed,
+                                                ice: ice,
+                                                id: id,
+                                            };
+                                            out.send(res.create_message());
+                                        }
+                                        _ => println!("not exist this client id {}", id),
+                                    }
+                                    Ok(())
+                                }
+                                _ => {
+                                    println!("Error: poisoned on Client iD{}", id);
+                                    self.client.close(CloseCode::Protocol)
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("not exist this steram id {}", id);
+                            self.client.close(CloseCode::Protocol)
+                        }
+                    }
+                }             
+                ResMessage::AnswerMsg(Source { name }) => {
+                    let mut streamlist = self.streamlist.lock().unwrap();
+                    let s = streamlist.streams.get_mut(&self.id);
+                    match s {
+                        Some(stream) => {
+                            stream.name = name;
                             stream.ready = true;
                             Ok(())
                         }
@@ -299,59 +399,8 @@ impl Handler for Hoster {
                             self.client.close(CloseCode::Protocol)
                         }
                     }
-                } else {
-                    let f: Result<ICE_cadinate, _> = json::decode(&text);
-                    if let Ok(get_text) = f {
-                        let mut streamlist = self.streamlist.lock().unwrap();
-                        let s_id = streamlist.streams.get_mut(&self.id);
-                        match s_id {
-                            Some(stream) => {
-                                println!("success cadinate");
-                                let v = stream.viewers.lock();
-                                match v {
-                                    Ok(mut viewers) => {
-                                        let viewer = viewers.get_mut(&get_text.id);
-                                        match viewer {
-                                            Some(out) => {
-                                                let ice = ICE {
-                                                    candidate: get_text.ice.candidate,
-                                                    sdpMid: get_text.ice.sdpMid,
-                                                    sdpMLineIndex: get_text.ice.sdpMLineIndex,
-                                                };
-
-                                                let ice_cadinate = ICE_cadinate {
-                                                    typed: get_text.typed,
-                                                    ice: ice,
-                                                    id: get_text.id,
-                                                };
-                                                out.send(ice_cadinate.to_json().to_string());
-                                            }
-                                            _ => {
-                                                println!(
-                                                    "not exist this client id {}",
-                                                    &get_text.id
-                                                )
-                                            }
-                                        }
-                                        Ok(())
-                                    }
-                                    _ => {
-                                        println!("Error: poisoned on Client iD{}", get_text.id);
-                                        self.client.close(CloseCode::Protocol)
-                                    }
-                                }
-                            }
-
-                            _ => {
-                                println!("not exist this steram id {}", &get_text.id);
-                                self.client.close(CloseCode::Protocol)
-                            }
-                        }
-                    } else {
-                        println!("cant perse {}", &text);
-                        self.client.close(CloseCode::Protocol)
-                    }
                 }
+                _ => self.client.close(CloseCode::Protocol),
             }
         } else {
             println!("Couldn't get message");
